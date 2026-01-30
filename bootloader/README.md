@@ -7,5 +7,5 @@ The bootloader uses `embassy-boot` to interact with the flash.
 Flash the bootloader
 
 ```
-cargo flash --features embassy-nrf/nrf52832 --release --chip nRF52832_xxAA
+cargo flash --features embassy-nrf/nrf52840 --release --chip nRF52840_xxAA
 ```
