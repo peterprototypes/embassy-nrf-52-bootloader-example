@@ -1,59 +1,49 @@
 #![no_std]
 #![no_main]
 
-use core::cell::RefCell;
 use core::mem;
 
+use crate::ble_dfu::BleDfu;
 use defmt::unwrap;
-
-use embassy_boot::BlockingFirmwareUpdater;
 use embassy_executor::Spawner;
-use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::Timer;
-
-use embassy_usb::{Builder, Config};
-use embassy_usb_dfu::consts::DfuAttributes;
-use embassy_usb_dfu::{ResetImmediate, new_state, usb_dfu};
-
-use embassy_nrf::gpio::{Level, Output, OutputDrive};
-use embassy_nrf::interrupt::Priority;
-use embassy_nrf::nvmc::Nvmc;
-use embassy_nrf::usb::Driver;
-use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
-use embassy_nrf::wdt::{self, Watchdog, WatchdogHandle};
-use embassy_nrf::{bind_interrupts, peripherals, usb};
-
-use embassy_boot_nrf::FirmwareUpdaterConfig;
-
-use nrf_softdevice::{Softdevice, raw};
 
 use {defmt_rtt as _, panic_probe as _};
 
-bind_interrupts!(
-    struct Irqs {
-        USBD => usb::InterruptHandler<peripherals::USBD>;
-    }
-);
+use embassy_nrf::gpio::{Level, Output, OutputDrive};
+use embassy_nrf::interrupt::Priority;
+use embassy_nrf::wdt::{self, Watchdog, WatchdogHandle};
+use nrf_softdevice::{
+    Flash, Softdevice,
+    ble::{advertisement_builder::ServiceList, gatt_server},
+    raw,
+};
+
+mod ble_dfu;
+use ble_dfu::FirmwareService;
+use ble_dfu::FirmwareServiceEvent;
+
+#[nrf_softdevice::gatt_server]
+struct Server {
+    firmware_service: FirmwareService,
+}
 
 #[embassy_executor::task]
 async fn softdevice_task(sd: &'static Softdevice) -> ! {
     sd.run().await
 }
 
-// This is a randomly generated GUID to allow clients on Windows to find your device.
-//
-// N.B. update to a custom GUID for your own device!
-const DEVICE_INTERFACE_GUIDS: &[&str] = &["{EAA9A5DC-30BB-44BC-9232-606CDC875321}"];
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    defmt::info!("Working");
+    defmt::info!("Starting");
 
     let mut config = embassy_nrf::config::Config::default();
     config.gpiote_interrupt_priority = Priority::P2;
     config.time_interrupt_priority = Priority::P2;
 
     let p = embassy_nrf::init(config);
+
+    defmt::info!("Embassy initialized");
 
     // softdevice init
     let config = nrf_softdevice::Config {
@@ -91,13 +81,16 @@ async fn main(spawner: Spawner) {
     };
 
     let sd = Softdevice::enable(&config);
+    let ble_server = unwrap!(Server::new(sd));
     spawner.spawn(unwrap!(softdevice_task(sd)));
 
-    let led = Output::new(p.P0_13, Level::Low, OutputDrive::Standard);
+    defmt::info!("Softdevice initialized");
+
+    let mut led = Output::new(p.P0_13, Level::Low, OutputDrive::Standard);
 
     let wdt = p.WDT;
     let wdt_config = wdt::Config::try_new(&wdt).unwrap();
-    let (_wdt, [wdt_handle]) = match Watchdog::try_new(wdt, wdt_config) {
+    let (_wdt, [mut wdt_handle]) = match Watchdog::try_new(wdt, wdt_config) {
         Ok(x) => x,
         Err(_) => {
             // Watchdog already active with the wrong number of handles, waiting for it to timeout...
@@ -107,74 +100,27 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    // Create the driver, from the HAL.
-    // Use software VBUS detect since SoftDevice controls the POWER_CLOCK peripheral
-    let vbus_detect = SoftwareVbusDetect::new(true, true);
-    let driver = Driver::new(p.USBD, Irqs, &vbus_detect);
+    defmt::info!("Watchdog initialized");
 
-    let mut config = Config::new(0xc0de, 0xcafe);
-    config.manufacturer = Some("Embassy");
-    config.product = Some("USB-DFU Runtime example");
-    config.serial_number = Some("1235678");
+    // spawner.spawn(unwrap!(blink_and_pet(led, wdt_handle)));
+    spawner.spawn(unwrap!(ble_server_task(sd, ble_server)));
 
-    let nvmc = Nvmc::new(p.NVMC);
-    let nvmc = Mutex::new(RefCell::new(nvmc));
-
-    let fw_config = FirmwareUpdaterConfig::from_linkerfile_blocking(&nvmc, &nvmc);
-    let mut magic = [0; 4];
-    let mut updater = BlockingFirmwareUpdater::new(fw_config, &mut magic);
-    updater.mark_booted().expect("Failed to mark booted");
-
-    let mut config_descriptor = [0; 256];
-    let mut bos_descriptor = [0; 256];
-    let mut control_buf = [0; 4096];
-
-    let mut state = new_state(updater, DfuAttributes::CAN_DOWNLOAD, ResetImmediate);
-
-    let mut builder = Builder::new(
-        driver,
-        config,
-        &mut config_descriptor,
-        &mut bos_descriptor,
-        &mut [],
-        &mut control_buf,
-    );
-
-    // We add MSOS headers so that the device automatically gets assigned the WinUSB driver on Windows.
-    // Otherwise users need to do this manually using a tool like Zadig.
-    //
-    // It seems these always need to be at added at the device level for this to work and for
-    // composite devices they also need to be added on the function level (as shown later).
-    //
-    // builder.msos_descriptor(msos::windows_version::WIN8_1, 2);
-    // builder.msos_feature(msos::CompatibleIdFeatureDescriptor::new("WINUSB", ""));
-    // builder.msos_feature(msos::RegistryPropertyFeatureDescriptor::new(
-    //     "DeviceInterfaceGUIDs",
-    //     msos::PropertyData::RegMultiSz(DEVICE_INTERFACE_GUIDS),
-    // ));
-
-    usb_dfu::<_, _, _, _, 4096>(&mut builder, &mut state, |func| {
-        // You likely don't have to add these function level headers if your USB device is not composite
-        // (i.e. if your device does not expose another interface in addition to DFU)
-        // func.msos_feature(msos::CompatibleIdFeatureDescriptor::new("WINUSB", ""));
-        // func.msos_feature(msos::RegistryPropertyFeatureDescriptor::new(
-        //     "DeviceInterfaceGUIDs",
-        //     msos::PropertyData::RegMultiSz(DEVICE_INTERFACE_GUIDS),
-        // ));
-    });
-
-    let mut dev = builder.build();
-
-    spawner.spawn(unwrap!(blink_and_pet(led, wdt_handle)));
-    spawner.spawn(unwrap!(advertise_task(sd)));
-
-    dev.run().await
+    loop {
+        wdt_handle.pet();
+        led.set_high();
+        Timer::after_millis(100).await;
+        led.set_low();
+        Timer::after_millis(100).await;
+    }
 }
 
 #[embassy_executor::task]
-async fn advertise_task(sd: &'static Softdevice) {
+async fn ble_server_task(sd: &'static Softdevice, server: Server) {
+    use embassy_futures::select::{Either, select};
+    use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+    use embassy_sync::channel::Channel;
     use nrf_softdevice::ble::advertisement_builder::{
-        Flag, LegacyAdvertisementBuilder, LegacyAdvertisementPayload, ServiceList, ServiceUuid16,
+        Flag, LegacyAdvertisementBuilder, LegacyAdvertisementPayload,
     };
     use nrf_softdevice::ble::peripheral;
 
@@ -183,21 +129,67 @@ async fn advertise_task(sd: &'static Softdevice) {
 
     static ADV_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new()
         .flags(&[Flag::GeneralDiscovery, Flag::LE_Only])
-        .services_16(ServiceList::Complete, &[ServiceUuid16::HEALTH_THERMOMETER]) // if there were a lot of these there may not be room for the full name
-        .short_name("Hello")
+        .short_name("BLE DFU")
         .build();
 
-    // but we can put it in the scan data
-    // so the full name is visible once connected
     static SCAN_DATA: LegacyAdvertisementPayload = LegacyAdvertisementBuilder::new()
-        .full_name("Hello, Rust!")
+        .services_128(
+            ServiceList::Incomplete,
+            &[0x00001000_b0cd_11ec_871f_d45ddf138840_u128.to_le_bytes()],
+        )
         .build();
 
-    let adv = peripheral::NonconnectableAdvertisement::ScannableUndirected {
+    let adv = peripheral::ConnectableAdvertisement::ScannableUndirected {
         adv_data: &ADV_DATA,
         scan_data: &SCAN_DATA,
     };
-    unwrap!(peripheral::advertise(sd, adv, &config).await);
+
+    let ble_dfu = BleDfu::new(sd).await;
+
+    loop {
+        let conn = unwrap!(peripheral::advertise_connectable(sd, adv, &config).await);
+
+        defmt::info!("BLE connected");
+
+        let channel: Channel<NoopRawMutex, FirmwareServiceEvent, 4> = Channel::new();
+
+        // Run the GATT server on the connection. This returns when the connection gets disconnected.
+        //
+        // Event enums (ServerEvent's) are generated by nrf_softdevice::gatt_server
+        // proc macro when applied to the Server struct above
+        let gatt_future = gatt_server::run(&conn, &server, |e| match e {
+            ServerEvent::FirmwareService(e) => {
+                if let Err(e) = channel.try_send(e) {
+                    defmt::error!("Try send error");
+                }
+            }
+        });
+
+        let handler_future = async {
+            loop {
+                let event = channel.receive().await;
+                ble_dfu.handle_event(event).await;
+            }
+        };
+
+        let e = match select(gatt_future, handler_future).await {
+            Either::First(e) => e, // gatt_server disconnected
+            Either::Second(_) => unreachable!(),
+        };
+
+        // Log the actual disconnect reason
+        if let Some(reason) = conn.disconnect_reason() {
+            defmt::info!("gatt_server disconnected, reason: {:?}", reason);
+        } else {
+            defmt::info!("gatt_server disconnected, reason unknown");
+        }
+
+        defmt::info!("gatt_server run exited with error: {:?}", e);
+
+        // Connection dropped — finalize DFU if it was requested.
+        // This runs outside select so flash writes can't be cancelled.
+        ble_dfu.finalize_if_pending().await;
+    }
 }
 
 #[embassy_executor::task]
