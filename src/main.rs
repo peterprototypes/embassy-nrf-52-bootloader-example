@@ -205,8 +205,8 @@ async fn blink_and_pet(mut led: Output<'static>, mut wdt_handle: WatchdogHandle)
     loop {
         wdt_handle.pet();
         led.set_high();
-        Timer::after_millis(1000).await;
+        Timer::after_millis(100).await;
         led.set_low();
-        Timer::after_millis(1000).await;
+        Timer::after_millis(100).await;
     }
 }
